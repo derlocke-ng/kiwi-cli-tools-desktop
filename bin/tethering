@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# tethering — set TTL 64 on traffic arriving from one interface, so devices
+# tethered to this machine look like the machine's own traffic to a carrier
+# that counts hops.
+#
+# The rule lives in the mangle table and does not survive a reboot. That is
+# deliberate: a networking workaround should disappear on its own rather than
+# outlive the trip it was needed for.
+#
+#   tethering            pick an interface and set the rule
+#   tethering --status   show the rules currently set
+#   tethering --off      remove every rule this tool set
+set -euo pipefail
+
+usage() { sed -n 's/^#   /  /p' "$0"; }
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+esac
+
+[[ $EUID -eq 0 ]] || exec sudo "$0" "$@"
+
+ours() { # the interfaces we have a TTL rule on
+    iptables -t mangle -S PREROUTING 2>/dev/null |
+        sed -n 's/^-A PREROUTING -i \([^ ]*\) -j TTL --ttl-set 64$/\1/p'
+}
+
+case "${1:-}" in
+    --status)
+        rules="$(ours)"
+        if [[ -n $rules ]]; then printf 'TTL 64 set on: %s\n' "$rules"
+        else echo "no TTL rule set"; fi
+        exit 0 ;;
+    --off)
+        found=0
+        for i in $(ours); do
+            iptables -t mangle -D PREROUTING -i "$i" -j TTL --ttl-set 64
+            echo "removed from $i"
+            found=1
+        done
+        (( found )) || echo "nothing to remove"
+        exit 0 ;;
+    "") ;;
+    *)  usage >&2; exit 1 ;;
+esac
+
+# real interfaces only: no loopback, and none of the common virtual prefixes.
+# (`cut -d@` strips the "@if2" suffix veth-style names carry.)
+mapfile -t ifaces < <(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 |
+    grep -Ev '^(lo|virbr|docker|veth|tun|tap|tailscale|wg|br-)')
+(( ${#ifaces[@]} )) || { echo "tethering: no usable network interface found" >&2; exit 1; }
+
+echo "Which interface do the tethered devices connect through?"
+PS3="interface: "
+select ifc in "${ifaces[@]}"; do
+    [[ ${ifc:-} ]] && break
+done
+
+if iptables -t mangle -C PREROUTING -i "$ifc" -j TTL --ttl-set 64 2>/dev/null; then
+    echo "TTL 64 is already set on $ifc"
+    exit 0
+fi
+iptables -t mangle -A PREROUTING -i "$ifc" -j TTL --ttl-set 64
+echo "TTL 64 set on $ifc — lasts until reboot; 'tethering --off' removes it now"

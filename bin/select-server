@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# select-server — pick an SSH host out of ~/.ssh/config and connect to it.
+#
+# Every alias on every `Host` line is a candidate; patterns (* ? !) are not,
+# because you cannot ssh to a wildcard. Nothing is written anywhere.
+set -euo pipefail
+
+cfg="${1:-$HOME/.ssh/config}"
+[[ -r $cfg ]] || { echo "select-server: no ssh config at $cfg" >&2; exit 1; }
+
+mapfile -t hosts < <(awk 'tolower($1)=="host" { for (i = 2; i <= NF; i++)
+                            if ($i !~ /[*?!]/) print $i }' "$cfg" | sort -u)
+(( ${#hosts[@]} )) || { echo "select-server: no concrete Host entries in $cfg" >&2; exit 1; }
+
+PS3="connect to: "
+select h in "${hosts[@]}"; do
+    [[ ${h:-} ]] && exec ssh "$h"
+done
