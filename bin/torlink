@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+# torlink — a poor man's VPN: reach TCP services (ssh, web, anything) on
+# another machine over Tor, with no open ports, no accounts and no server.
+#
+# Tor and socat run in one rootless podman container; nothing but podman is
+# needed on the host. A machine can both offer services and use other
+# machines' services.
+#
+# Identity is an onion address. Meeting is one out-of-band exchange: the
+# offering side makes an invite code for one peer, and the other side accepts
+# it. The invite carries a Tor client-authorization key, so the service is
+# invisible to everybody without it. Treat an invite like a password.
+#
+#   torlink add-service NAME PORT      offer 127.0.0.1:PORT as NAME
+#   torlink rm-service NAME            stop offering NAME
+#   torlink invite PEER NAME...        make an invite code for PEER (secret!)
+#   torlink revoke PEER                cut PEER off for good
+#   torlink accept CODE PEER           save someone's invite as PEER
+#   torlink forget PEER                drop a saved PEER
+#   torlink connect PEER NAME [PORT]   forward 127.0.0.1:PORT to PEER's NAME
+#   torlink disconnect PEER NAME       drop that forward
+#   torlink ssh [USER@]PEER [ARGS]     ssh to PEER's "ssh" service
+#   torlink ssh-config                 ~/.ssh/config blocks for every PEER
+#   torlink up | down | status | logs  run the container
+#   torlink ls                         everything, in one view
+#
+# State lives in ~/.local/share/torlink (TORLINK_HOME). TORLINK_NAME and
+# TORLINK_SOCKS rename the container and its local SOCKS port, so a second
+# instance can run side by side.
+set -euo pipefail
+
+D="${TORLINK_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/torlink}"
+NAME="${TORLINK_NAME:-torlink}"
+SOCKS="${TORLINK_SOCKS:-19050}"
+IMAGE=localhost/torlink:2
+
+usage() { sed -n 's/^#   /  /p' "$0"; }
+die() { echo "torlink: $*" >&2; exit 1; }
+
+command -v podman >/dev/null || die "podman is required"
+
+valid() { [[ $1 =~ ^[a-z0-9_-]+$ ]] || die "'$1': use only a-z 0-9 _ -"; }
+
+mkdir -p -m 700 "$D" "$D/hs" "$D/auth" "$D/tor"
+touch "$D/services" "$D/peers" "$D/forwards"
+[[ -d $D/grants ]] || mkdir -m 700 "$D/grants"
+
+running() { [[ $(podman container inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null) == true ]]; }
+
+# --- lookups ----------------------------------------------------------------
+svc_port()   { awk -v n="$1" '$1==n {print $2; exit}' "$D/services"; }
+peer_onion() { awk -v p="$1" '$1==p {print $2; exit}' "$D/peers"; }
+peer_port()  { # PEER SERVICE -> the port SERVICE has on PEER
+    awk -v p="$1" '$1==p {print $3; exit}' "$D/peers" | tr , '\n' |
+        awk -F= -v s="$2" '$1==s {print $2; exit}'
+}
+drop_line() { # FILE FIELD1 [FIELD2] — delete matching lines
+    awk -v a="$2" -v b="${3:-}" '!($1==a && (b=="" || $2==b))' "$1" > "$1.new"
+    mv "$1.new" "$1"
+}
+
+# --- container --------------------------------------------------------------
+image() {
+    podman image exists "$IMAGE" && return
+    echo "building $IMAGE (once) ..."
+    local t; t="$(mktemp -d)"
+    cat > "$t/Containerfile" <<'EOF'
+FROM docker.io/library/alpine:3.20
+RUN apk add --no-cache tor socat openssl coreutils
+EOF
+    podman build -q -t "$IMAGE" "$t" >/dev/null || { rm -rf "$t"; die "image build failed"; }
+    rm -rf "$t"
+}
+
+write_conf() { # torrc and the container's start script, from the state files
+    {
+        echo "DataDirectory /data/tor"
+        echo "SocksPort 127.0.0.1:$SOCKS"
+        echo "ClientOnionAuthDir /data/auth"
+        echo "Log notice stdout"
+        local g peer name port
+        for g in "$D"/grants/*; do
+            [[ -f $g ]] || continue
+            peer="${g##*/}"
+            echo "HiddenServiceDir /data/hs/$peer"
+            while read -r name port; do
+                echo "HiddenServicePort $port 127.0.0.1:$port"
+            done < "$g"
+        done
+    } > "$D/torrc"
+    {
+        echo "#!/bin/sh"
+        local p s l onion port
+        while read -r p s l; do
+            onion="$(peer_onion "$p")"; port="$(peer_port "$p" "$s")"
+            [[ -n $onion && -n $port ]] || continue
+            echo "socat TCP-LISTEN:$l,bind=127.0.0.1,fork,reuseaddr SOCKS4A:127.0.0.1:$onion.onion:$port,socksport=$SOCKS &"
+        done < "$D/forwards"
+        echo "exec tor -f /data/torrc"
+    } > "$D/run.sh"
+}
+
+reload() { # make the running container notice a changed torrc
+    running || return 0
+    write_conf
+    podman kill -s HUP "$NAME" >/dev/null
+}
+
+wait_boot() {
+    local i
+    for ((i = 0; i < 90; i++)); do
+        podman logs "$NAME" 2>&1 | grep -q 'Bootstrapped 100%' && return 0
+        running || die "container stopped: $(podman logs --tail 5 "$NAME" 2>&1)"
+        sleep 1
+    done
+    return 1
+}
+
+cmd_up() {
+    image
+    write_conf
+    podman rm -f "$NAME" >/dev/null 2>&1 || true
+    podman run -d --name "$NAME" --network host --pull=never \
+        --cap-drop all --security-opt no-new-privileges \
+        -v "$D:/data:Z" "$IMAGE" sh /data/run.sh >/dev/null
+    echo "starting tor ..."
+    if wait_boot; then echo "tor is up"
+    else echo "tor is still bootstrapping (torlink status)"; fi
+}
+
+cmd_down() { podman rm -f "$NAME" >/dev/null 2>&1 || true; echo "stopped"; }
+
+cmd_status() {
+    if running; then
+        local b; b="$(podman logs "$NAME" 2>&1 | grep -o 'Bootstrapped [0-9]*%' | tail -1 || true)"
+        echo "running — ${b:-starting}"
+    else
+        echo "not running"
+    fi
+}
+
+# --- offering services ------------------------------------------------------
+cmd_add_service() {
+    [[ $# -eq 2 ]] || die "usage: torlink add-service NAME PORT"
+    valid "$1"
+    [[ $2 =~ ^[0-9]+$ ]] && (( $2 >= 1 && $2 <= 65535 )) || die "'$2' is not a port"
+    [[ -z $(svc_port "$1") ]] || die "service '$1' already exists"
+    echo "$1 $2" >> "$D/services"
+    echo "offering $1 = 127.0.0.1:$2 (reachable only by peers you invite to it)"
+}
+
+cmd_rm_service() {
+    [[ $# -eq 1 ]] || die "usage: torlink rm-service NAME"
+    [[ -n $(svc_port "$1") ]] || die "no service '$1'"
+    drop_line "$D/services" "$1"
+    local g
+    for g in "$D"/grants/*; do [[ -f $g ]] && drop_line "$g" "$1"; done
+    reload
+    echo "removed $1 (also from every invite)"
+}
+
+cmd_invite() {
+    [[ $# -ge 2 ]] || die "usage: torlink invite PEER NAME..."
+    local peer="$1"; shift
+    valid "$peer"
+    [[ ! -e $D/grants/$peer ]] || die "'$peer' already has an invite (torlink revoke $peer first)"
+    local s port map=""
+    for s in "$@"; do
+        port="$(svc_port "$s")"
+        [[ -n $port ]] || die "no service '$s' (torlink add-service)"
+        map+="${map:+,}$s=$port"
+    done
+    image
+    local priv pub
+    read -r priv pub < <(podman run --rm --pull=never "$IMAGE" sh -c '
+        openssl genpkey -algorithm x25519 -out /tmp/k 2>/dev/null
+        b32() { base32 | tr -d "=\n"; }
+        echo "$(openssl pkey -in /tmp/k -outform DER | tail -c 32 | b32)" \
+             "$(openssl pkey -in /tmp/k -pubout -outform DER | tail -c 32 | b32)"')
+    [[ -n ${pub:-} ]] || die "key generation failed"
+    mkdir -m 700 "$D/hs/$peer" "$D/hs/$peer/authorized_clients"
+    echo "descriptor:x25519:$pub" > "$D/hs/$peer/authorized_clients/$peer.auth"
+    for s in "$@"; do echo "$s $(svc_port "$s")"; done > "$D/grants/$peer"
+    if running; then reload; else cmd_up; fi
+    local i host=""
+    for ((i = 0; i < 30; i++)); do
+        [[ -s $D/hs/$peer/hostname ]] && { host="$(<"$D/hs/$peer/hostname")"; break; }
+        sleep 1
+    done
+    [[ -n $host ]] || die "tor did not create the onion service (torlink logs)"
+    echo "invite for '$peer' (services: ${map//,/ }) — send it over a channel you trust:"
+    echo
+    echo "torlink1:${host%.onion}:$priv:$map"
+    echo
+    echo "the service is reachable about a minute after tor has published it"
+}
+
+cmd_revoke() {
+    [[ $# -eq 1 ]] || die "usage: torlink revoke PEER"
+    [[ -e $D/grants/$1 ]] || die "no invite for '$1'"
+    rm -rf "$D/grants/$1" "${D:?}/hs/$1"
+    reload
+    echo "revoked $1 — that onion address is gone for good"
+}
+
+# --- using other machines' services -----------------------------------------
+cmd_accept() {
+    [[ $# -eq 2 ]] || die "usage: torlink accept CODE PEER"
+    local code="$1" peer="$2" magic onion priv map
+    valid "$peer"
+    [[ -z $(peer_onion "$peer") ]] || die "peer '$peer' already exists"
+    IFS=: read -r magic onion priv map <<< "$code"
+    [[ $magic == torlink1 && $onion =~ ^[a-z2-7]{56}$ && $priv =~ ^[A-Z2-7]{52}$ \
+        && $map =~ ^[a-z0-9_=,-]+$ ]] || die "that is not a torlink invite code"
+    ( umask 077; echo "$onion:descriptor:x25519:$priv" > "$D/auth/$peer.auth_private" )
+    echo "$peer $onion $map" >> "$D/peers"
+    reload
+    echo "saved '$peer' — services: ${map//,/ }"
+    echo "try: torlink connect $peer ${map%%=*}"
+}
+
+cmd_forget() {
+    [[ $# -eq 1 ]] || die "usage: torlink forget PEER"
+    [[ -n $(peer_onion "$1") ]] || die "no peer '$1'"
+    local s l
+    while read -r _ s l; do cmd_disconnect "$1" "$s"; done < <(awk -v p="$1" '$1==p' "$D/forwards")
+    drop_line "$D/peers" "$1"
+    rm -f "$D/auth/$1.auth_private"
+    reload
+    echo "forgot $1"
+}
+
+free_port() {
+    local p
+    for ((p = 2200; p < 2300; p++)); do
+        grep -q " $p\$" "$D/forwards" && continue
+        (echo > "/dev/tcp/127.0.0.1/$p") 2>/dev/null && continue
+        echo "$p"; return
+    done
+    die "no free local port between 2200 and 2299"
+}
+
+start_forward() { # PEER SERVICE LOCALPORT — start it in the running container
+    local onion port
+    onion="$(peer_onion "$1")"; port="$(peer_port "$1" "$2")"
+    podman exec -d "$NAME" socat "TCP-LISTEN:$3,bind=127.0.0.1,fork,reuseaddr" \
+        "SOCKS4A:127.0.0.1:$onion.onion:$port,socksport=$SOCKS"
+}
+
+cmd_connect() {
+    [[ $# -ge 2 && $# -le 3 ]] || die "usage: torlink connect PEER NAME [LOCALPORT]"
+    [[ -n $(peer_onion "$1") ]] || die "no peer '$1' (torlink accept)"
+    [[ -n $(peer_port "$1" "$2") ]] || die "'$1' offers no service '$2'"
+    awk -v p="$1" -v s="$2" '$1==p && $2==s {f=1} END {exit !f}' "$D/forwards" &&
+        die "already forwarded (torlink ls)"
+    local l="${3:-}"
+    if [[ -z $l ]]; then l="$(free_port)"
+    elif (echo > "/dev/tcp/127.0.0.1/$l") 2>/dev/null; then die "local port $l is in use"
+    fi
+    echo "$1 $2 $l" >> "$D/forwards"
+    if running; then
+        start_forward "$1" "$2" "$l"
+        echo "127.0.0.1:$l -> $1/$2 (first connect may take ~30s while tor finds the service)"
+    else
+        echo "127.0.0.1:$l -> $1/$2 once started (torlink up)"
+    fi
+}
+
+cmd_disconnect() {
+    [[ $# -eq 2 ]] || die "usage: torlink disconnect PEER NAME"
+    local l
+    l="$(awk -v p="$1" -v s="$2" '$1==p && $2==s {print $3; exit}' "$D/forwards")"
+    [[ -n $l ]] || die "no forward $1/$2"
+    drop_line "$D/forwards" "$1" "$2"
+    running && podman exec "$NAME" pkill -f "TCP-LISTEN:$l," || true
+    echo "dropped 127.0.0.1:$l"
+}
+
+proxy() { echo "podman exec -i $NAME socat - SOCKS4A:127.0.0.1:%h:%p,socksport=$SOCKS"; }
+
+cmd_ssh() {
+    [[ $# -ge 1 ]] || die "usage: torlink ssh [USER@]PEER [ssh args]"
+    local user="" peer="$1"; shift
+    if [[ $peer == *@* ]]; then user="${peer%@*}@"; peer="${peer#*@}"; fi
+    local onion port
+    onion="$(peer_onion "$peer")"; port="$(peer_port "$peer" ssh)"
+    [[ -n $port ]] || die "'$peer' offers no service named 'ssh'"
+    running || die "tor is not running (torlink up)"
+    exec ssh -o "ProxyCommand=$(proxy)" -o "HostKeyAlias=torlink-$peer" \
+        -p "$port" "$user$onion.onion" "$@"
+}
+
+cmd_ssh_config() {
+    local p onion port
+    while read -r p onion _; do
+        port="$(peer_port "$p" ssh)"
+        [[ -n $port ]] || continue
+        printf 'Host %s-tor\n    HostName %s.onion\n    Port %s\n    HostKeyAlias torlink-%s\n    ProxyCommand %s\n\n' \
+            "$p" "$onion" "$port" "$p" "$(proxy)"
+    done < "$D/peers"
+}
+
+cmd_ls() {
+    echo "tor: $(cmd_status)"
+    echo; echo "offering:"
+    [[ -s $D/services ]] || echo "  (none — torlink add-service)"
+    local n p g host
+    while read -r n p; do echo "  $n -> 127.0.0.1:$p"; done < "$D/services"
+    echo; echo "invited peers:"
+    local any=0
+    for g in "$D"/grants/*; do
+        [[ -f $g ]] || continue; any=1
+        host="$(cat "$D/hs/${g##*/}/hostname" 2>/dev/null || echo '(not created yet)')"
+        echo "  ${g##*/}: $(awk '{printf "%s ", $1}' "$g") — $host"
+    done
+    (( any )) || echo "  (none — torlink invite)"
+    echo; echo "saved peers:"
+    [[ -s $D/peers ]] || echo "  (none — torlink accept)"
+    local onion map
+    while read -r p onion map; do echo "  $p: ${map//,/ } — $onion.onion"; done < "$D/peers"
+    echo; echo "forwards:"
+    [[ -s $D/forwards ]] || echo "  (none — torlink connect)"
+    local s l
+    while read -r p s l; do echo "  127.0.0.1:$l -> $p/$s"; done < "$D/forwards"
+}
+
+case "${1:-}" in
+    add-service)   shift; cmd_add_service "$@" ;;
+    rm-service)    shift; cmd_rm_service "$@" ;;
+    invite)        shift; cmd_invite "$@" ;;
+    revoke)        shift; cmd_revoke "$@" ;;
+    accept)        shift; cmd_accept "$@" ;;
+    forget)        shift; cmd_forget "$@" ;;
+    connect)       shift; cmd_connect "$@" ;;
+    disconnect)    shift; cmd_disconnect "$@" ;;
+    ssh)           shift; cmd_ssh "$@" ;;
+    ssh-config)    cmd_ssh_config ;;
+    up)            cmd_up ;;
+    down)          cmd_down ;;
+    status)        cmd_status ;;
+    logs)          exec podman logs -f "$NAME" ;;
+    ls|"")         cmd_ls ;;
+    -h|--help)     usage ;;
+    *)             usage >&2; exit 1 ;;
+esac

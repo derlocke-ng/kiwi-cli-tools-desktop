@@ -1,6 +1,6 @@
 # kiwi-cli-tools-desktop
 
-Three small CLI helpers for a Linux desktop. Installable with
+Four small CLI helpers for a Linux desktop. Installable with
 [kiwi-updater](https://github.com/derlocke-ng/kiwi-updater) — or standalone
 with `./install.sh install`, which puts them in `~/.local/bin`.
 
@@ -46,6 +46,37 @@ tethering            # pick the interface, set the rule (idempotent)
 tethering --status   # show what is set
 tethering --off      # remove it now
 ```
+
+## torlink
+
+A poor man's VPN: reach any TCP service (ssh, a web UI, a database) on
+another machine over Tor — no open ports, no accounts, no server. Tor and
+socat run in one rootless podman container, so podman is all you need.
+
+An onion address is the identity. Meeting takes one out-of-band exchange:
+the offering side makes an **invite code** for one peer, the other side
+accepts it. The code carries a Tor client-authorization key, so the service
+is invisible to everyone without it — treat the code like a password.
+
+```
+# machine A: offer ssh and a web UI to "bob"
+torlink add-service ssh 22
+torlink add-service web 8080
+torlink invite bob ssh web          # prints torlink1:...  (secret!)
+
+# machine B: use them
+torlink accept torlink1:... alice
+torlink up
+torlink ssh alice                   # ssh over tor
+torlink connect alice web           # 127.0.0.1:2200 -> alice's web
+torlink ssh-config >> ~/.ssh/config # then `ssh alice-tor` (and select-server) work
+```
+
+Each invite is its own onion service with only the services you listed, so
+`torlink revoke bob` removes that access for good. `torlink ls` shows
+services, peers and forwards. Tor is TCP only (no UDP), and the first
+connection takes a while. The container uses host networking so it can reach
+your local services; its SOCKS port (19050) is open on loopback only.
 
 ## License
 
