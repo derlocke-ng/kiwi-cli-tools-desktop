@@ -17,12 +17,20 @@ case "${1:-install}" in
         done
         echo "installed: ${TOOLS[*]} -> $PREFIX/bin" ;;
     uninstall)
+        # torlink's container would otherwise keep serving onion services
+        # with no tool left to stop it. State and image stay unless --purge.
+        purge=0
+        [[ "${KIWI_PURGE:-0}" == 1 || "${2:-}" == --purge ]] && purge=1
+        if [[ -x $PREFIX/bin/torlink ]] && command -v podman >/dev/null; then
+            if (( purge )); then "$PREFIX/bin/torlink" purge --yes
+            else "$PREFIX/bin/torlink" down --all; fi
+        fi
         for t in "${TOOLS[@]}"; do
             rm -f "$PREFIX/bin/$t"
         done
         # Only on --purge: an ordinary uninstall keeps pweb's certificate so
         # browsers that accepted it once do not have to warn again later.
-        if [[ "${KIWI_PURGE:-0}" == 1 || "${2:-}" == --purge ]]; then
+        if (( purge )); then
             rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/pweb"
             echo "purged pweb's certificate"
         fi

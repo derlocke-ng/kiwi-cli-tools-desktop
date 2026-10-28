@@ -78,6 +78,11 @@ services, peers and forwards. Tor is TCP only (no UDP), and the first
 connection takes a while. The container uses host networking so it can reach
 your local services; its SOCKS port (19050) is open on loopback only.
 
+State (including your onion keys) lives in `~/.local/share/torlink`.
+`./install.sh uninstall` stops every torlink container but keeps that state
+and the image; `uninstall --purge` (or `torlink purge`) deletes the
+containers, the image and all state — those onion addresses are then gone.
+
 ## License
 
 GPL-3.0-or-later.
