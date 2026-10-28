@@ -25,13 +25,23 @@ Ctrl+C when done.
 
 A numbered menu of every concrete `Host` alias in your `~/.ssh/config`; pick
 one and it connects. Wildcard patterns are skipped, aliases are de-duplicated
-and sorted. A different config file can be given as the first argument.
+and sorted. Another config file can be given with `-f FILE`.
+
+Hosts can carry **tags**, a comment line inside the Host block (ssh ignores
+it), and you can filter by them:
 
 ```
-$ select-server
-1) backup    3) pi
-2) hetzner   4) work
-connect to: 3
+Host db1 db2
+    # tags: work prod
+    HostName ...
+```
+
+```
+$ select-server work          # only hosts tagged work (several tags = all must match)
+1) db1  [work prod]    3) web  [work]
+2) db2  [work prod]
+connect to: 2
+$ select-server --tags        # work (3), prod (2), home (1)
 ```
 
 ## tethering
