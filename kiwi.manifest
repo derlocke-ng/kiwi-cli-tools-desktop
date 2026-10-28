@@ -1,20 +1,20 @@
 # kiwi.manifest — see https://github.com/derlocke-ng/kiwi-updater
 NAME=kiwi-cli-tools-desktop
-DESCRIPTION=Small desktop CLI helpers — share a directory over HTTPS, pick an SSH host from your config, fix tethering TTL
-VERSION=1.0.1
+DESCRIPTION=Small desktop CLI helpers — share a directory over HTTPS, pick an SSH host from your config, fix tethering TTL, reach TCP services over Tor
+VERSION=1.1.0
 AUTHOR=derlocke-ng
 HOMEPAGE=https://github.com/derlocke-ng/kiwi-cli-tools-desktop
 LICENSE=GPL-3.0-or-later
 
 COMPONENTS=cli
 CATEGORY=Network
-TAGS=https share ssh tethering ttl terminal
+TAGS=https share ssh tethering ttl terminal tor onion vpn podman
 # the app's own icon, shown by the kiwi GUI — from kiwi-icons
 # (svg/classic/kiwi-cli-tools-desktop.svg)
 ICON=data/kiwi-cli-tools-desktop.svg
 
 SCOPES=user
 
-DEPENDS=python3 openssl ssh ip iptables
+DEPENDS=python3 openssl ssh ip iptables podman
 
 INSTALLER=install.sh

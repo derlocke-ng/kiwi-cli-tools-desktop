@@ -8,7 +8,7 @@ set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${KIWI_PREFIX:-$HOME/.local}"
-TOOLS=(pweb select-server tethering)
+TOOLS=(pweb select-server tethering torlink)
 
 case "${1:-install}" in
     install|update)
