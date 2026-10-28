@@ -318,7 +318,7 @@ cmd_ssh_config() {
     while read -r p onion _; do
         port="$(peer_port "$p" ssh)"
         [[ -n $port ]] || continue
-        printf 'Host %s-tor\n    HostName %s.onion\n    Port %s\n    HostKeyAlias torlink-%s\n    ProxyCommand %s\n\n' \
+        printf 'Host %s-tor\n    # tags: tor\n    HostName %s.onion\n    Port %s\n    HostKeyAlias torlink-%s\n    ProxyCommand %s\n\n' \
             "$p" "$onion" "$port" "$p" "$(proxy)"
     done < "$D/peers"
 }

@@ -79,7 +79,7 @@ torlink accept torlink1:... alice
 torlink up
 torlink ssh alice                   # ssh over tor
 torlink connect alice web           # 127.0.0.1:2200 -> alice's web
-torlink ssh-config >> ~/.ssh/config # then `ssh alice-tor` (and select-server) work
+torlink ssh-config >> ~/.ssh/config # then `ssh alice-tor` works; `select-server tor` lists them
 ```
 
 Each invite is its own onion service with only the services you listed, so
