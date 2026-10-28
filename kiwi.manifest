@@ -1,7 +1,7 @@
 # kiwi.manifest — see https://github.com/derlocke-ng/kiwi-updater
 NAME=kiwi-cli-tools-desktop
 DESCRIPTION=Small desktop CLI helpers — share a directory over HTTPS, pick an SSH host from your config, fix tethering TTL, reach TCP services over Tor
-VERSION=1.1.0
+VERSION=1.1.1
 AUTHOR=derlocke-ng
 HOMEPAGE=https://github.com/derlocke-ng/kiwi-cli-tools-desktop
 LICENSE=GPL-3.0-or-later

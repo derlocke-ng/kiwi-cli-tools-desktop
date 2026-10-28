@@ -22,9 +22,12 @@
 #   torlink ssh [USER@]PEER [ARGS]     ssh to PEER's "ssh" service
 #   torlink ssh-config                 ~/.ssh/config blocks for every PEER
 #   torlink up | down | status | logs  run the container
+#   torlink down --all                 stop every torlink container
+#   torlink purge [--yes]              also delete the image and ALL state
 #   torlink ls                         everything, in one view
 #
-# State lives in ~/.local/share/torlink (TORLINK_HOME). TORLINK_NAME and
+# State lives in ~/.local/share/torlink (TORLINK_HOME); it holds your onion
+# keys, so deleting it (purge) gives up those addresses for good. TORLINK_NAME and
 # TORLINK_SOCKS rename the container and its local SOCKS port, so a second
 # instance can run side by side.
 set -euo pipefail
@@ -120,7 +123,7 @@ cmd_up() {
     image
     write_conf
     podman rm -f "$NAME" >/dev/null 2>&1 || true
-    podman run -d --name "$NAME" --network host --pull=never \
+    podman run -d --name "$NAME" --label torlink=1 --network host --pull=never \
         --cap-drop all --security-opt no-new-privileges \
         -v "$D:/data:Z" "$IMAGE" sh /data/run.sh >/dev/null
     echo "starting tor ..."
@@ -128,7 +131,27 @@ cmd_up() {
     else echo "tor is still bootstrapping (torlink status)"; fi
 }
 
-cmd_down() { podman rm -f "$NAME" >/dev/null 2>&1 || true; echo "stopped"; }
+cmd_down() {
+    if [[ ${1:-} == --all ]]; then
+        podman ps -aq --filter label=torlink=1 | xargs -r podman rm -f >/dev/null
+    else
+        podman rm -f "$NAME" >/dev/null 2>&1 || true
+    fi
+    echo "stopped"
+}
+
+cmd_purge() { # containers, image and every key — gone, not recoverable
+    if [[ ${1:-} != --yes ]]; then
+        echo "this deletes all torlink containers, the image and $D"
+        echo "including your onion keys: those addresses can never come back."
+        read -r -p "type 'purge' to continue: " a
+        [[ $a == purge ]] || die "aborted"
+    fi
+    cmd_down --all >/dev/null
+    podman rmi -f "$IMAGE" >/dev/null 2>&1 || true
+    rm -rf "${D:?}"
+    echo "purged"
+}
 
 cmd_status() {
     if running; then
@@ -336,7 +359,8 @@ case "${1:-}" in
     ssh)           shift; cmd_ssh "$@" ;;
     ssh-config)    cmd_ssh_config ;;
     up)            cmd_up ;;
-    down)          cmd_down ;;
+    down)          shift; cmd_down "$@" ;;
+    purge)         shift; cmd_purge "$@" ;;
     status)        cmd_status ;;
     logs)          exec podman logs -f "$NAME" ;;
     ls|"")         cmd_ls ;;
