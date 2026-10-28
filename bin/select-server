@@ -3,16 +3,75 @@
 #
 # Every alias on every `Host` line is a candidate; patterns (* ? !) are not,
 # because you cannot ssh to a wildcard. Nothing is written anywhere.
+#
+# Hosts can carry tags: a comment line inside the Host block (ssh ignores it):
+#
+#   Host db1 db2
+#       # tags: work prod
+#       HostName ...
+#
+#   select-server              every host
+#   select-server work         only hosts tagged work
+#   select-server work prod    only hosts with both tags
+#   select-server --tags       list the tags in use
+#
+# A different config file can be given with -f FILE (or, as before, as the
+# first argument when it contains a "/").
 set -euo pipefail
 
-cfg="${1:-$HOME/.ssh/config}"
+cfg="$HOME/.ssh/config"
+tags=()
+list_tags=0
+
+while (( $# )); do
+    case "$1" in
+        -h|--help) sed -n 's/^#   /  /p' "$0"; exit 0 ;;
+        --tags)    list_tags=1 ;;
+        -f)        cfg="${2:?select-server: -f needs a file}"; shift ;;
+        */*)       cfg="$1" ;;
+        *)         tags+=("${1,,}") ;;
+    esac
+    shift
+done
+
 [[ -r $cfg ]] || { echo "select-server: no ssh config at $cfg" >&2; exit 1; }
 
-mapfile -t hosts < <(awk 'tolower($1)=="host" { for (i = 2; i <= NF; i++)
-                            if ($i !~ /[*?!]/) print $i }' "$cfg" | sort -u)
-(( ${#hosts[@]} )) || { echo "select-server: no concrete Host entries in $cfg" >&2; exit 1; }
+# one "alias<TAB>tag tag" line per concrete alias. A tags comment applies to
+# the whole Host line it sits under, up to the next Host or Match.
+entries="$(awk '
+    function flush(   i) {
+        for (i = 1; i <= n; i++) print al[i] "\t" tg
+        n = 0; tg = ""
+    }
+    tolower($1) == "host"  { flush(); for (i = 2; i <= NF; i++) if ($i !~ /[*?!]/) al[++n] = $i; next }
+    tolower($1) == "match" { flush(); next }
+    /^[ \t]*#[ \t]*tags?:/ { t = $0; sub(/^[ \t]*#[ \t]*tags?:[ \t]*/, "", t); gsub(/[, \t]+/, " ", t); sub(/ $/, "", t); tg = tg (tg ? " " : "") tolower(t) }
+    END { flush() }
+' "$cfg")"
+
+if (( list_tags )); then
+    cut -f2 <<< "$entries" | tr ' ' '\n' | sed '/^$/d' | sort | uniq -c | awk '{print $2 " (" $1 ")"}'
+    exit 0
+fi
+
+hosts=() labels=()
+while IFS=$'\t' read -r h t; do
+    [[ $h ]] || continue
+    ok=1
+    for want in "${tags[@]}"; do [[ " $t " == *" $want "* ]] || ok=0; done
+    (( ok )) || continue
+    # de-duplicate: the same alias can show up under several Host lines
+    [[ " ${hosts[*]-} " == *" $h "* ]] && continue
+    hosts+=("$h"); labels+=("$h${t:+  [$t]}")
+done < <(sort -u <<< "$entries")
+
+(( ${#hosts[@]} )) || {
+    echo "select-server: no matching Host entries in $cfg${tags[*]:+ for tag(s): ${tags[*]}}" >&2
+    exit 1
+}
 
 PS3="connect to: "
-select h in "${hosts[@]}"; do
-    [[ ${h:-} ]] && exec ssh "$h"
+select _ in "${labels[@]}"; do
+    [[ ${REPLY:-} =~ ^[0-9]+$ ]] && (( REPLY >= 1 && REPLY <= ${#hosts[@]} )) &&
+        exec ssh "${hosts[REPLY-1]}"
 done
